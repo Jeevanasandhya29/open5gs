@@ -279,6 +279,81 @@ static void _gtpv1_tun_recv_eth_cb(short when, ogs_socket_t fd, void *data)
     _gtpv1_tun_recv_common_cb(when, fd, true, data);
 }
 
+/*
+ * A G-PDU on a known tunnel must carry an IP packet (UPF sessions are IPv4,
+ * IPv6 or IPv4v6). Some gNBs forward RAN-internal control PDUs received from
+ * the UE (e.g. 16-byte non-IP PDUs right after a QoS flow is added) or
+ * truncated packets as G-PDUs on N3. Such payloads are not user traffic:
+ * they must be discarded without any action, in particular without a GTP-U
+ * Error Indication, which makes the gNB delete the tunnel and tear down the
+ * PDU session or bearer (3GPP TS 29.281 clause 7.3.1 requires an Error
+ * Indication only when no tunnel context exists; here it does).
+ */
+static bool upf_gpdu_payload_is_ip(ogs_pkbuf_t *pkbuf)
+{
+    uint8_t ip_v;
+
+    if (!pkbuf || !pkbuf->data || pkbuf->len < 1)
+        return false;
+
+    ip_v = (*(uint8_t *)pkbuf->data) >> 4;
+
+    if (ip_v == 4) {
+        struct ip *ip_h = (struct ip *)pkbuf->data;
+        size_t ip_hlen, ip_len;
+
+        if (pkbuf->len < (unsigned int)sizeof(struct ip))
+            return false;
+
+        ip_hlen = (size_t)ip_h->ip_hl * 4;
+        ip_len = be16toh(ip_h->ip_len);
+
+        if (ip_hlen < sizeof(struct ip) || ip_hlen > ip_len)
+            return false;
+        if (ip_len > (size_t)pkbuf->len)
+            return false;
+
+        return true;
+
+    } else if (ip_v == 6) {
+        struct ip6_hdr *ip6_h = (struct ip6_hdr *)pkbuf->data;
+        size_t payload_len;
+
+        if (pkbuf->len < (unsigned int)sizeof(struct ip6_hdr))
+            return false;
+
+        /* Payload length 0 means a jumbogram; rule matching checks it. */
+        payload_len = be16toh(ip6_h->ip6_plen);
+        if (payload_len &&
+            sizeof(struct ip6_hdr) + payload_len > (size_t)pkbuf->len)
+            return false;
+
+        return true;
+    }
+
+    return false;
+}
+
+static void upf_gpdu_drop_malformed(ogs_pkbuf_t *pkbuf,
+        uint32_t teid, uint8_t qfi, const ogs_sockaddr_t *from)
+{
+    static uint64_t dropped = 0;
+    char buf[OGS_ADDRSTRLEN];
+
+    dropped++;
+    /* Rate-limited: the first 10, then every 1000th. */
+    if (dropped <= 10 || (dropped % 1000) == 0) {
+        ogs_warn("[DROP] Non-IP/malformed G-PDU [TEID:0x%x QFI:%d "
+                "len:%u first-byte:0x%02x] from [%s] - discarded, "
+                "no Error Indication (total %llu)",
+                teid, qfi, pkbuf->len,
+                pkbuf->len ? *(uint8_t *)pkbuf->data : 0,
+                OGS_ADDR(from, buf), (unsigned long long)dropped);
+        ogs_log_hexdump(OGS_LOG_WARN, pkbuf->data,
+                pkbuf->len > 64 ? 64 : pkbuf->len);
+    }
+}
+
 static void _gtpv1_u_recv_one(ogs_socket_t fd, ogs_sock_t *sock, ogs_pkbuf_t *pkbuf, const ogs_sockaddr_t *from)
 {
     int len;
@@ -420,6 +495,17 @@ static void _gtpv1_u_recv_one(ogs_socket_t fd, ogs_sock_t *sock, ogs_pkbuf_t *pk
                         sock, header_desc.teid,
                         header_desc.qos_flow_identifier, from);
             }
+            goto cleanup;
+        }
+
+        /*
+         * The tunnel exists. Discard a payload that is not a well-formed
+         * IP packet before any PDR matching, so that it can neither be
+         * forwarded nor trigger an Error Indication towards the RAN.
+         */
+        if (!upf_gpdu_payload_is_ip(pkbuf)) {
+            upf_gpdu_drop_malformed(pkbuf, header_desc.teid,
+                    header_desc.qos_flow_identifier, from);
             goto cleanup;
         }
 
