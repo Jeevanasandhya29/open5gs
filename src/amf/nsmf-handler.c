@@ -1096,6 +1096,57 @@ int amf_nsmf_pdusession_handle_update_sm_context(
             return OGS_ERROR;
         }
 
+        if (state == AMF_UPDATE_SM_CONTEXT_DUPLICATED_PDU_SESSION_ID) {
+            /*
+             * The UE sent PDU Session Establishment Request (initial)
+             * for a PSI the AMF still holds, so the AMF first asked the
+             * SMF to release the old SM context
+             * (REL_DUE_TO_DUPLICATE_SESSION_ID), and the SMF refused.
+             *
+             * Typical case: the SMF has already removed that session on
+             * its side (e.g. after a state machine exception) and
+             * answers 404, while the AMF still keeps the smContextRef.
+             * The UE has already considered the old session released,
+             * for example after an initial registration.
+             *
+             * This used to send NGAP ErrorIndication and stop. The new
+             * request was never forwarded and the stale context stayed,
+             * so every retry by the UE (T3580) failed the same way until
+             * it deregistered: the IMS PDU session could not be set up.
+             *
+             * TS 24.501 5.4.5.2.3 (initial request with a PDU session ID
+             * already in use): the AMF releases the existing PDU session
+             * and processes the new request. Release the old SM context
+             * locally and create the new one.
+             */
+            ogs_warn("[%s:%d] Duplicated PDU session release failed "
+                    "[%d] - released locally, creating new SM context",
+                    amf_ue->supi ? amf_ue->supi : "Unknown",
+                    sess->psi, recvmsg->res_status);
+
+            CLEAR_SESSION_CONTEXT(sess);
+
+            if (!amf_ue->supi) {
+                ogs_warn("SUPI is NULL. Skipping create SM context for "
+                        "duplicated PDU Session (psi: %d)", sess->psi);
+                return OGS_ERROR;
+            }
+            if (!ran_ue) {
+                ogs_warn("[%s] RAN-NG Context has already been removed",
+                        amf_ue->supi);
+                return OGS_ERROR;
+            }
+
+            r = amf_sess_sbi_discover_and_send(
+                    OpenAPI_service_name_nsmf_pdusession, NULL,
+                    amf_nsmf_pdusession_build_create_sm_context,
+                    ran_ue, sess, AMF_CREATE_SM_CONTEXT_NO_STATE, NULL);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+
+            return OGS_OK;
+        }
+
         SmContextUpdateError = recvmsg->SmContextUpdateError;
         if (!SmContextUpdateError) {
             ogs_error("[%d:%d] No SmContextUpdateError [%d]",
